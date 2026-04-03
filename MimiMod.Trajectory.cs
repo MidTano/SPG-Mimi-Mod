@@ -916,50 +916,10 @@ public partial class MimiMod
         return Mathf.Clamp(EstimatePowerFromLaunchSpeed(requiredVelocity), 0.05f, 2f);
     }
 
-    private float ApplyHeightPowerCompensation(float basePower, float heightDifference)
-    {
-        float clampedBasePower = Mathf.Clamp(basePower, 0.05f, 2f);
-        if (Mathf.Abs(heightDifference) < 0.01f)
-        {
-            return clampedBasePower;
-        }
-
-        float baseVelocity = Mathf.Max(0.1f, EstimateLaunchSpeedFromPower(clampedBasePower));
-        float compensatedVelocitySquared = baseVelocity * baseVelocity + (2f * trajectoryGravity * heightDifference);
-        float compensatedPower = clampedBasePower;
-
-        if (compensatedVelocitySquared > 0.001f && !float.IsNaN(compensatedVelocitySquared) && !float.IsInfinity(compensatedVelocitySquared))
-        {
-            compensatedPower = EstimatePowerFromLaunchSpeed(Mathf.Sqrt(compensatedVelocitySquared));
-        }
-
-        if (heightDifference > 0.05f)
-        {
-            compensatedPower = Mathf.Max(compensatedPower, clampedBasePower);
-        }
-        else if (heightDifference < -0.05f)
-        {
-            compensatedPower = Mathf.Min(compensatedPower, clampedBasePower);
-        }
-
-        return Mathf.Clamp(compensatedPower, 0.05f, 2f);
-    }
-
     private float CalculateIdealPower(float distance, float heightDifference)
     {
         float horizontalDistance = Mathf.Max(0.01f, distance);
         float referencePitch = 45f;
-
-        if (heightDifference > 0.05f)
-        {
-            referencePitch += Mathf.Clamp(heightDifference * 1.25f, 0f, 8f);
-        }
-        else if (heightDifference < -0.05f)
-        {
-            referencePitch -= Mathf.Clamp(Mathf.Abs(heightDifference) * 0.85f, 0f, 6f);
-        }
-
-        referencePitch = Mathf.Clamp(referencePitch, 8f, 55f);
         float pitchRad = referencePitch * Mathf.Deg2Rad;
         float cos = Mathf.Cos(pitchRad);
         float denominator = 2f * cos * cos * (horizontalDistance * Mathf.Tan(pitchRad) - heightDifference);
@@ -975,10 +935,6 @@ public partial class MimiMod
         else
         {
             requiredSpeed = Mathf.Sqrt(horizontalDistance * trajectoryGravity);
-            if (heightDifference > 0f)
-            {
-                requiredSpeed += Mathf.Sqrt(2f * trajectoryGravity * heightDifference);
-            }
         }
 
         return Mathf.Clamp(EstimatePowerFromLaunchSpeed(Mathf.Max(0.1f, requiredSpeed)), 0.05f, 2f);
@@ -1069,7 +1025,9 @@ public partial class MimiMod
         try
         {
             Component[] allComponents = FindAllComponents();
-            float closestHoleDistance = float.MaxValue;
+            Vector3 referencePosition = golfBall != null ? golfBall.transform.position : playerGolfer.transform.position;
+            float closestHoleDistanceSq = float.MaxValue;
+            bool foundHole = false;
 
             for (int i = 0; i < allComponents.Length; i++)
             {
@@ -1079,30 +1037,150 @@ public partial class MimiMod
                     continue;
                 }
 
-                Type compType = comp.GetType();
-                FieldInfo flagField = compType.GetField("flag", BindingFlags.NonPublic | BindingFlags.Instance);
-                Transform flagTransform = flagField != null ? flagField.GetValue(comp) as Transform : null;
-                if (flagTransform == null)
+                Vector3 holeCandidate;
+                Vector3 flagCandidate;
+                if (!TryResolveHoleCandidate(comp, out holeCandidate, out flagCandidate))
                 {
                     continue;
                 }
 
-                Vector3 holeCandidate = flagTransform.position;
-                float distance = Vector3.Distance(playerGolfer.transform.position, holeCandidate);
-                if (distance <= 0.05f || distance >= closestHoleDistance)
+                Vector3 flatReferencePosition = new Vector3(referencePosition.x, 0f, referencePosition.z);
+                Vector3 flatHoleCandidate = new Vector3(holeCandidate.x, 0f, holeCandidate.z);
+                float distanceSq = (flatHoleCandidate - flatReferencePosition).sqrMagnitude;
+                if (distanceSq <= 0.0025f || distanceSq >= closestHoleDistanceSq)
                 {
                     continue;
                 }
 
-                closestHoleDistance = distance;
+                closestHoleDistanceSq = distanceSq;
                 holePosition = holeCandidate;
-                flagPosition = holeCandidate;
+                flagPosition = flagCandidate;
+                foundHole = true;
             }
+
+            return foundHole;
         }
         catch
         {
+            return false;
+        }
+    }
+
+    private bool TryResolveHoleCandidate(Component golfHoleComponent, out Vector3 resolvedHolePosition, out Vector3 resolvedFlagPosition)
+    {
+        resolvedHolePosition = Vector3.zero;
+        resolvedFlagPosition = Vector3.zero;
+        if (golfHoleComponent == null)
+        {
+            return false;
         }
 
-        return holePosition != Vector3.zero;
+        Vector3 componentPosition = golfHoleComponent.transform.position;
+        bool hasHolePosition = false;
+        bool hasFlagPosition = false;
+
+        Transform exactHoleTransform = TryResolveTransformMember(golfHoleComponent,
+            "hole",
+            "Hole",
+            "cup",
+            "Cup",
+            "holeTransform",
+            "HoleTransform",
+            "cupTransform",
+            "CupTransform",
+            "target",
+            "Target");
+        if (exactHoleTransform != null)
+        {
+            resolvedHolePosition = exactHoleTransform.position;
+            hasHolePosition = IsFiniteVector3(resolvedHolePosition);
+        }
+
+        Vector3 memberVector;
+        if (!hasHolePosition && TryResolveVector3Member(golfHoleComponent, out memberVector,
+            "holePosition",
+            "HolePosition",
+            "cupPosition",
+            "CupPosition",
+            "targetPosition",
+            "TargetPosition"))
+        {
+            resolvedHolePosition = memberVector;
+            hasHolePosition = true;
+        }
+
+        Transform flagTransform = TryResolveTransformMember(golfHoleComponent,
+            "flag",
+            "Flag",
+            "flagTransform",
+            "FlagTransform");
+        if (flagTransform != null)
+        {
+            resolvedFlagPosition = flagTransform.position;
+            hasFlagPosition = IsFiniteVector3(resolvedFlagPosition);
+        }
+
+        if (!hasHolePosition)
+        {
+            resolvedHolePosition = hasFlagPosition
+                ? new Vector3(resolvedFlagPosition.x, componentPosition.y, resolvedFlagPosition.z)
+                : componentPosition;
+            hasHolePosition = IsFiniteVector3(resolvedHolePosition);
+        }
+
+        if (!hasFlagPosition)
+        {
+            resolvedFlagPosition = resolvedHolePosition;
+            hasFlagPosition = hasHolePosition;
+        }
+
+        return hasHolePosition && hasFlagPosition;
+    }
+
+    private Transform TryResolveTransformMember(object instance, params string[] memberNames)
+    {
+        for (int i = 0; i < memberNames.Length; i++)
+        {
+            object memberValue = ModReflectionHelper.GetMemberValue(instance, memberNames[i]);
+            if (memberValue is Transform)
+            {
+                return (Transform)memberValue;
+            }
+
+            if (memberValue is Component)
+            {
+                return ((Component)memberValue).transform;
+            }
+
+            if (memberValue is GameObject)
+            {
+                return ((GameObject)memberValue).transform;
+            }
+        }
+
+        return null;
+    }
+
+    private bool TryResolveVector3Member(object instance, out Vector3 resolvedValue, params string[] memberNames)
+    {
+        resolvedValue = Vector3.zero;
+        for (int i = 0; i < memberNames.Length; i++)
+        {
+            object memberValue = ModReflectionHelper.GetMemberValue(instance, memberNames[i]);
+            if (memberValue is Vector3)
+            {
+                resolvedValue = (Vector3)memberValue;
+                return IsFiniteVector3(resolvedValue);
+            }
+        }
+
+        return false;
+    }
+
+    private bool IsFiniteVector3(Vector3 value)
+    {
+        return !float.IsNaN(value.x) && !float.IsInfinity(value.x) &&
+               !float.IsNaN(value.y) && !float.IsInfinity(value.y) &&
+               !float.IsNaN(value.z) && !float.IsInfinity(value.z);
     }
 }
