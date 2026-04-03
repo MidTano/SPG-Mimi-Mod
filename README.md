@@ -71,3 +71,6 @@ Output: `Mods/MimiMod.dll`
 ## Tested With
 - `Super.Battle.Golf.Build.22228202`
 - `MelonLoader v0.5.4 Open-Beta`
+
+## Unknowncheats
+https://www.unknowncheats.me/forum/other-games/746254-super-battle-golf-aim.html#post4640372
