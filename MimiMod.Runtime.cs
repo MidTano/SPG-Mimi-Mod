@@ -225,6 +225,7 @@ public partial class MimiMod
         nextPredictedPathRefreshTime = 0f;
         currentAimTargetPosition = Vector3.zero;
         currentSwingOriginPosition = Vector3.zero;
+        windAimOffset = Vector3.zero;
         holePosition = Vector3.zero;
         flagPosition = Vector3.zero;
         nextHoleSearchTime = 0f;

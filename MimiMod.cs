@@ -170,6 +170,15 @@ public partial class MimiMod : MelonMod
     private readonly float predictedPathRebuildPowerEpsilon = 0.0025f;
     private readonly float predictedPathRebuildPitchEpsilon = 0.05f;
 
+    private bool windReflectionInitialized;
+    private PropertyInfo cachedWindManagerWindProperty;
+    private PropertyInfo cachedWindManagerCurrentWindSpeedProperty;
+    private float cachedWindFactor = 0.12f;
+    private float cachedCrossWindFactor = 0.25f;
+    private bool windFactorsResolved;
+    private Component windFactorsSourceBall;
+    private Vector3 windAimOffset = Vector3.zero;
+
     private readonly string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Mods", "MimiMod.cfg");
     private string assistToggleKeyName = "F";
     private string coffeeBoostKeyName = "F2";
