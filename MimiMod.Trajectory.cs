@@ -267,6 +267,13 @@ public partial class MimiMod
         float airDragFactor = GetRuntimeLinearAirDragFactor();
         float pointSpacingSq = predictedPathPointSpacing * predictedPathPointSpacing;
 
+        Vector3 windVector;
+        bool hasWind = TryGetWindVector(out windVector);
+        if (hasWind) ResolveWindFactors();
+        float wf = cachedWindFactor;
+        float cwf = cachedCrossWindFactor;
+        Vector3 windForSim = hasWind ? windVector : Vector3.zero;
+
         outputPoints.Add(shotOrigin);
 
         Vector3 position = shotOrigin;
@@ -281,10 +288,7 @@ public partial class MimiMod
         {
             Vector3 previousPosition = position;
             velocity += gravity * dt;
-            float speedSq = velocity.sqrMagnitude;
-            float damping = Mathf.Max(0f, 1f - airDragFactor * speedSq * dt);
-            velocity *= damping;
-
+            ApplyWindAwareDrag(ref velocity, windForSim, wf, cwf, airDragFactor, dt);
             position += velocity * dt;
 
             if (trackImpactPreview && !impactResolved)
@@ -799,7 +803,7 @@ public partial class MimiMod
 
         float airDrag = GetRuntimeLinearAirDragFactor();
         float dt = Mathf.Clamp(Time.fixedDeltaTime, 0.005f, 0.04f);
-        float gravityY = -Mathf.Abs(trajectoryGravity);
+        float gravityY = -GetEffectiveGravityMagnitude();
         float bestSpeed = 0f;
         float bestAbsError = float.MaxValue;
         bool hasPrev = false;
@@ -898,6 +902,7 @@ public partial class MimiMod
             return Mathf.Clamp(EstimatePowerFromLaunchSpeed(solvedVelocity), 0.05f, 2f);
         }
 
+        float gravity = GetEffectiveGravityMagnitude();
         float pitchRad = swingPitch * Mathf.Deg2Rad;
         float cos = Mathf.Cos(pitchRad);
         float denominator = 2f * cos * cos * (horizontalDistance * Mathf.Tan(pitchRad) - heightDifference);
@@ -906,7 +911,7 @@ public partial class MimiMod
             return Mathf.Clamp(CalculateIdealPower(horizontalDistance, heightDifference), 0.05f, 2f);
         }
 
-        float requiredVelocitySquared = trajectoryGravity * horizontalDistance * horizontalDistance / denominator;
+        float requiredVelocitySquared = gravity * horizontalDistance * horizontalDistance / denominator;
         if (requiredVelocitySquared <= 0.001f || float.IsNaN(requiredVelocitySquared) || float.IsInfinity(requiredVelocitySquared))
         {
             return Mathf.Clamp(CalculateIdealPower(horizontalDistance, heightDifference), 0.05f, 2f);
@@ -919,6 +924,7 @@ public partial class MimiMod
     private float CalculateIdealPower(float distance, float heightDifference)
     {
         float horizontalDistance = Mathf.Max(0.01f, distance);
+        float gravity = GetEffectiveGravityMagnitude();
         float referencePitch = 45f;
         float pitchRad = referencePitch * Mathf.Deg2Rad;
         float cos = Mathf.Cos(pitchRad);
@@ -927,14 +933,14 @@ public partial class MimiMod
         float requiredSpeed;
         if (denominator > 0.001f)
         {
-            float requiredSpeedSquared = trajectoryGravity * horizontalDistance * horizontalDistance / denominator;
+            float requiredSpeedSquared = gravity * horizontalDistance * horizontalDistance / denominator;
             requiredSpeed = requiredSpeedSquared <= 0.001f || float.IsNaN(requiredSpeedSquared) || float.IsInfinity(requiredSpeedSquared)
-                ? Mathf.Sqrt(horizontalDistance * trajectoryGravity)
+                ? Mathf.Sqrt(horizontalDistance * gravity)
                 : Mathf.Sqrt(requiredSpeedSquared);
         }
         else
         {
-            requiredSpeed = Mathf.Sqrt(horizontalDistance * trajectoryGravity);
+            requiredSpeed = Mathf.Sqrt(horizontalDistance * gravity);
         }
 
         return Mathf.Clamp(EstimatePowerFromLaunchSpeed(Mathf.Max(0.1f, requiredSpeed)), 0.05f, 2f);
@@ -957,17 +963,12 @@ public partial class MimiMod
                 return;
             }
 
-            currentAimTargetPosition = GetAimTargetPosition(ballPosition);
+            Vector3 holeTarget = GetAimTargetPosition(ballPosition);
             currentSwingOriginPosition = GetSwingOriginPosition();
 
             Vector3 shotOrigin = golfBall != null
                 ? golfBall.transform.position
                 : (currentSwingOriginPosition != Vector3.zero ? currentSwingOriginPosition : playerPosition);
-
-            Vector3 toTarget = currentAimTargetPosition - shotOrigin;
-            Vector3 horizontalToTarget = new Vector3(toTarget.x, 0f, toTarget.z);
-            float horizontalDistance = horizontalToTarget.magnitude;
-            float heightDifference = toTarget.y;
 
             float currentPower;
             float currentPitch;
@@ -979,8 +980,53 @@ public partial class MimiMod
             }
 
             idealSwingPitch = currentPitch;
-            float physicsPower = CalculateRequiredPowerForPitch(horizontalDistance, heightDifference, idealSwingPitch);
-            idealSwingPower = physicsPower;
+
+            Vector3 windVector;
+            bool hasWind = TryGetWindVector(out windVector);
+            if (hasWind) ResolveWindFactors();
+
+            currentAimTargetPosition = holeTarget;
+            windAimOffset = Vector3.zero;
+
+            Vector3 toInitial = holeTarget - shotOrigin;
+            Vector3 horizontalToInitial = new Vector3(toInitial.x, 0f, toInitial.z);
+            float initDist = Mathf.Max(0.1f, horizontalToInitial.magnitude);
+            float initHeight = toInitial.y;
+            idealSwingPower = CalculateRequiredPowerForPitch(initDist, initHeight, idealSwingPitch);
+
+            float maxOffset = initDist * 0.4f;
+
+            for (int iter = 0; iter < 3; iter++)
+            {
+                Vector3 landing = SimulateShotLanding(shotOrigin, currentAimTargetPosition,
+                    idealSwingPitch, idealSwingPower, windVector, hasWind);
+
+                Vector3 error = holeTarget - landing;
+                error.y = 0f;
+
+                if (error.sqrMagnitude < 0.01f) break;
+
+                float correctionStrength = iter == 0 ? 0.8f : 0.5f;
+                currentAimTargetPosition += error * correctionStrength;
+
+                Vector3 totalOffset = currentAimTargetPosition - holeTarget;
+                totalOffset.y = 0f;
+                if (totalOffset.sqrMagnitude > maxOffset * maxOffset)
+                {
+                    totalOffset = totalOffset.normalized * maxOffset;
+                    currentAimTargetPosition = holeTarget + new Vector3(totalOffset.x, 0f, totalOffset.z);
+                }
+
+                windAimOffset = new Vector3(
+                    currentAimTargetPosition.x - holeTarget.x,
+                    0f,
+                    currentAimTargetPosition.z - holeTarget.z);
+
+                Vector3 toAdj = currentAimTargetPosition - shotOrigin;
+                Vector3 horizontalToAdj = new Vector3(toAdj.x, 0f, toAdj.z);
+                idealSwingPower = CalculateRequiredPowerForPitch(
+                    Mathf.Max(0.01f, horizontalToAdj.magnitude), toAdj.y, idealSwingPitch);
+            }
         }
         catch
         {
@@ -1182,5 +1228,251 @@ public partial class MimiMod
         return !float.IsNaN(value.x) && !float.IsInfinity(value.x) &&
                !float.IsNaN(value.y) && !float.IsInfinity(value.y) &&
                !float.IsNaN(value.z) && !float.IsInfinity(value.z);
+    }
+
+    private float GetEffectiveGravityMagnitude()
+    {
+        float gravityY = Physics.gravity.y;
+        return gravityY < -0.01f ? -gravityY : trajectoryGravity;
+    }
+
+    private bool TryGetWindVector(out Vector3 wind)
+    {
+        wind = Vector3.zero;
+
+        if (!windReflectionInitialized)
+        {
+            windReflectionInitialized = true;
+            try
+            {
+                Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
+                for (int i = 0; i < assemblies.Length; i++)
+                {
+                    Type windManagerType = assemblies[i].GetType("WindManager");
+                    if (windManagerType != null)
+                    {
+                        cachedWindManagerWindProperty = windManagerType.GetProperty("Wind",
+                            BindingFlags.Public | BindingFlags.Static);
+                        cachedWindManagerCurrentWindSpeedProperty = windManagerType.GetProperty("CurrentWindSpeed",
+                            BindingFlags.Public | BindingFlags.Static);
+                        break;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        if (cachedWindManagerWindProperty == null)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (cachedWindManagerCurrentWindSpeedProperty != null)
+            {
+                int speed = (int)cachedWindManagerCurrentWindSpeedProperty.GetValue(null, null);
+                if (speed <= 0) return false;
+            }
+
+            object result = cachedWindManagerWindProperty.GetValue(null, null);
+            if (result is Vector3)
+            {
+                wind = (Vector3)result;
+                return wind.sqrMagnitude > 0.001f;
+            }
+        }
+        catch { }
+
+        return false;
+    }
+
+    private void ResolveWindFactors()
+    {
+        if (windFactorsResolved && ReferenceEquals(windFactorsSourceBall, golfBall))
+        {
+            return;
+        }
+
+        windFactorsResolved = true;
+        windFactorsSourceBall = golfBall;
+
+        if (golfBall == null) return;
+
+        try
+        {
+            Component hittable = null;
+            Component[] components = golfBall.gameObject.GetComponents<Component>();
+            for (int i = 0; i < components.Length; i++)
+            {
+                if (components[i] != null && components[i].GetType().Name == "Hittable")
+                {
+                    hittable = components[i];
+                    break;
+                }
+            }
+
+            if (hittable == null) return;
+
+            object settings = ModReflectionHelper.GetMemberValue(hittable, "settings");
+            if (settings == null) return;
+
+            object windSettings = ModReflectionHelper.GetMemberValue(settings, "Wind");
+            if (windSettings == null) return;
+
+            float wf = ModReflectionHelper.GetFloatMemberValue(windSettings, "WindFactor", cachedWindFactor);
+            float cwf = ModReflectionHelper.GetFloatMemberValue(windSettings, "CrossWindFactor", cachedCrossWindFactor);
+
+            if (!float.IsNaN(wf) && !float.IsInfinity(wf) && wf > 0f)
+                cachedWindFactor = wf;
+            if (!float.IsNaN(cwf) && !float.IsInfinity(cwf) && cwf > 0f)
+                cachedCrossWindFactor = cwf;
+        }
+        catch { }
+    }
+
+    private void ApplyWindAwareDrag(ref Vector3 velocity, Vector3 windVector, float windFact,
+        float crossWindFact, float airDragFactor, float dt)
+    {
+        Vector3 relativeVelocity = velocity;
+        if (windVector.sqrMagnitude > 0.001f && velocity.sqrMagnitude > 0.001f)
+        {
+            Vector3 windAligned = Vector3.Project(windVector, velocity);
+            Vector3 windCross = windVector - windAligned;
+            Vector3 windEffect = windAligned * windFact + windCross * crossWindFact;
+            relativeVelocity = velocity - windEffect;
+        }
+
+        float speedSq = relativeVelocity.sqrMagnitude;
+        float dampingValue = Mathf.Max(0f, airDragFactor * speedSq * dt);
+        velocity -= relativeVelocity * dampingValue;
+    }
+
+    private Vector3 SimulateShotLanding(Vector3 shotOrigin, Vector3 aimTarget, float swingPitch,
+        float power, Vector3 windVector, bool hasWind)
+    {
+        ResolveWindFactors();
+        float launchSpeed = Mathf.Max(0.1f, EstimateLaunchSpeedFromPower(power));
+
+        Vector3 toTarget = aimTarget - shotOrigin;
+        Vector3 horizontal = new Vector3(toTarget.x, 0f, toTarget.z);
+        if (horizontal.sqrMagnitude < 0.0001f)
+            return shotOrigin;
+
+        Vector3 horizontalDir = horizontal.normalized;
+        float pitchRad = swingPitch * Mathf.Deg2Rad;
+        Vector3 launchDir = (horizontalDir * Mathf.Cos(pitchRad) + Vector3.up * Mathf.Sin(pitchRad)).normalized;
+
+        float dt = Mathf.Clamp(Time.fixedDeltaTime, 0.005f, 0.04f);
+        Vector3 gravity = Physics.gravity;
+        float airDrag = GetRuntimeLinearAirDragFactor();
+        float wf = cachedWindFactor;
+        float cwf = cachedCrossWindFactor;
+        float targetY = aimTarget.y;
+        Vector3 windForSim = hasWind ? windVector : Vector3.zero;
+
+        Vector3 pos = shotOrigin;
+        Vector3 vel = launchDir * launchSpeed;
+        bool pastApex = false;
+
+        for (int i = 0; i < 600; i++)
+        {
+            Vector3 prevPos = pos;
+            vel += gravity * dt;
+            ApplyWindAwareDrag(ref vel, windForSim, wf, cwf, airDrag, dt);
+            pos += vel * dt;
+
+            if (!pastApex && vel.y < 0f) pastApex = true;
+
+            if (pastApex && pos.y <= targetY)
+            {
+                float seg = prevPos.y - pos.y;
+                if (seg > 0.001f)
+                {
+                    float t = Mathf.Clamp01((prevPos.y - targetY) / seg);
+                    return Vector3.Lerp(prevPos, pos, t);
+                }
+                return pos;
+            }
+        }
+
+        return pos;
+    }
+
+    private Vector3 EstimateWindLandingOffset(Vector3 shotOrigin, Vector3 aimTarget, float swingPitch,
+        float power, Vector3 windVector)
+    {
+        ResolveWindFactors();
+
+        float launchSpeed = Mathf.Max(0.1f, EstimateLaunchSpeedFromPower(power));
+
+        Vector3 toTarget = aimTarget - shotOrigin;
+        Vector3 horizontal = new Vector3(toTarget.x, 0f, toTarget.z);
+        if (horizontal.sqrMagnitude < 0.0001f)
+            return Vector3.zero;
+
+        Vector3 horizontalDir = horizontal.normalized;
+        float pitchRad = swingPitch * Mathf.Deg2Rad;
+        Vector3 launchDir = (horizontalDir * Mathf.Cos(pitchRad) + Vector3.up * Mathf.Sin(pitchRad)).normalized;
+
+        float dt = Mathf.Clamp(Time.fixedDeltaTime, 0.005f, 0.04f);
+        Vector3 gravity = Physics.gravity;
+        float airDrag = GetRuntimeLinearAirDragFactor();
+        float wf = cachedWindFactor;
+        float cwf = cachedCrossWindFactor;
+        float targetY = aimTarget.y;
+
+        Vector3 posWind = shotOrigin;
+        Vector3 velWind = launchDir * launchSpeed;
+        Vector3 posNoWind = shotOrigin;
+        Vector3 velNoWind = launchDir * launchSpeed;
+        float elapsed = 0f;
+        bool windLanded = false;
+        bool noWindLanded = false;
+        Vector3 windLandPos = shotOrigin;
+        Vector3 noWindLandPos = shotOrigin;
+
+        for (int i = 0; i < 600 && elapsed <= predictedPathMaxTime; i++)
+        {
+            if (!windLanded)
+            {
+                Vector3 prevWind = posWind;
+                velWind += gravity * dt;
+                ApplyWindAwareDrag(ref velWind, windVector, wf, cwf, airDrag, dt);
+                posWind += velWind * dt;
+
+                if (i > 5 && posWind.y <= targetY && velWind.y < 0)
+                {
+                    float seg = prevWind.y - posWind.y;
+                    float t = seg > 0.001f ? Mathf.Clamp01((prevWind.y - targetY) / seg) : 1f;
+                    windLandPos = Vector3.Lerp(prevWind, posWind, t);
+                    windLanded = true;
+                }
+            }
+
+            if (!noWindLanded)
+            {
+                Vector3 prevNoWind = posNoWind;
+                velNoWind += gravity * dt;
+                ApplyWindAwareDrag(ref velNoWind, Vector3.zero, wf, cwf, airDrag, dt);
+                posNoWind += velNoWind * dt;
+
+                if (i > 5 && posNoWind.y <= targetY && velNoWind.y < 0)
+                {
+                    float seg = prevNoWind.y - posNoWind.y;
+                    float t = seg > 0.001f ? Mathf.Clamp01((prevNoWind.y - targetY) / seg) : 1f;
+                    noWindLandPos = Vector3.Lerp(prevNoWind, posNoWind, t);
+                    noWindLanded = true;
+                }
+            }
+
+            if (windLanded && noWindLanded) break;
+            elapsed += dt;
+        }
+
+        if (!windLanded) windLandPos = posWind;
+        if (!noWindLanded) noWindLandPos = posNoWind;
+
+        return windLandPos - noWindLandPos;
     }
 }

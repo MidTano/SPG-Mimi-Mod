@@ -244,7 +244,8 @@ public partial class MimiMod
 
             Vector3 playerPosition = playerGolfer.transform.position;
             Vector3 aimReferencePosition = golfBall != null ? golfBall.transform.position : playerPosition;
-            currentAimTargetPosition = GetAimTargetPosition(aimReferencePosition);
+            Vector3 baseAimTarget = GetAimTargetPosition(aimReferencePosition);
+            currentAimTargetPosition = baseAimTarget + windAimOffset;
             currentSwingOriginPosition = GetSwingOriginPosition();
 
             if (currentAimTargetPosition == Vector3.zero || currentSwingOriginPosition == Vector3.zero)
